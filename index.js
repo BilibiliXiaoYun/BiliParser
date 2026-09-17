@@ -68,6 +68,73 @@ async function getFinalUrl(startUrl, maxRedirects = 10) {
     throw new Error('Too many redirects');
 }
 
+const cookieJar = new Map();
+function jarHeader(host) {
+    if (!/bilibili\.com$/.test(host)) return '';
+    const parts = [];
+    for (const [k, v] of cookieJar) parts.push(k + '=' + v);
+    return parts.join('; ');
+}
+function absorbCookies(host, setCookie) {
+    if (!/bilibili\.com$/.test(host) || !setCookie) return;
+    for (const raw of [].concat(setCookie)) {
+        const pair = String(raw).split(';')[0];
+        const eq = pair.indexOf('=');
+        if (eq <= 0) continue;
+        const k = pair.slice(0, eq).trim();
+        const v = pair.slice(eq + 1).trim();
+        if (k && v) cookieJar.set(k, v);
+    }
+}
+let sessionReady = null;
+async function ensureSession() {
+    if (sessionReady) return sessionReady;
+    sessionReady = (async () => {
+        try {
+            // 1) homepage plants the base risk-control cookies
+            await rawGet('https://www.bilibili.com/', { 'User-Agent': UA });
+            // 2) finger/spi hands out buvid3 / buvid4
+            const spi = await rawGet('https://api.bilibili.com/x/frontend/finger/spi',
+                { 'User-Agent': UA, 'Referer': REFERER });
+            try {
+                const j = JSON.parse(spi.body);
+                if (j.data?.b3) cookieJar.set('buvid3', j.data.b3);
+                if (j.data?.b4) cookieJar.set('buvid4', j.data.b4);
+            } catch (e) { /* keep whatever the homepage gave us */ }
+            if (!cookieJar.has('buvid3')) {
+                cookieJar.set('buvid3', 'FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc');
+            }
+        } catch (e) {
+            if (!cookieJar.has('buvid3')) {
+                cookieJar.set('buvid3', 'FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc');
+            }
+        }
+        return cookieJar;
+    })();
+    return sessionReady;
+}
+
+function rawGet(urlStr, headers) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(urlStr);
+        const client = parsed.protocol === 'http:' ? http : https;
+        const req = client.request({
+            method: 'GET',
+            hostname: parsed.hostname,
+            path: parsed.pathname + parsed.search,
+            headers
+        }, (resp) => {
+            absorbCookies(parsed.hostname, resp.headers['set-cookie']);
+            let body = '';
+            resp.on('data', c => body += c);
+            resp.on('end', () => resolve({ statusCode: resp.statusCode, headers: resp.headers, body }));
+        });
+        req.on('error', reject);
+        req.setTimeout(20000, () => req.destroy(new Error('request timeout')));
+        req.end();
+    });
+}
+
 async function httpGetJson(urlStr, extraHeaders = {}) {
     const parsed = new URL(urlStr);
     const options = {
@@ -76,25 +143,60 @@ async function httpGetJson(urlStr, extraHeaders = {}) {
         path: parsed.pathname + parsed.search,
         headers: { 'User-Agent': UA, ...extraHeaders }
     };
-    return new Promise((resolve, reject) => {
-        https.get(options, (resp) => {
-            let body = '';
-            resp.on('data', chunk => body += chunk);
-            resp.on('end', () => {
-                try {
-                    resolve(JSON.parse(body));
-                } catch (e) {
-                    reject(new Error('JSON parse error: ' + body));
-                }
+    const isBili = /bilibili\.com$/.test(parsed.hostname);
+    if (isBili) await ensureSession();
+
+    const attempt = () => {
+        const headers = { 'User-Agent': UA, ...extraHeaders };
+        if (isBili) {
+            const jar = jarHeader(parsed.hostname);
+            if (jar) headers['Cookie'] = headers['Cookie'] ? headers['Cookie'] + '; ' + jar : jar;
+        }
+        return new Promise((resolve, reject) => {
+            const client = parsed.protocol === 'http:' ? http : https;
+            const req = client.request({
+                method: 'GET',
+                hostname: parsed.hostname,
+                path: parsed.pathname + parsed.search,
+                headers
+            }, (resp) => {
+                absorbCookies(parsed.hostname, resp.headers['set-cookie']);
+                let body = '';
+                resp.on('data', chunk => body += chunk);
+                resp.on('end', () => resolve({ statusCode: resp.statusCode, body }));
             });
-        }).on('error', reject);
-    });
+            req.on('error', reject);
+            req.setTimeout(20000, () => req.destroy(new Error('request timeout')));
+            req.end();
+        });
+    };
+
+    let last;
+    for (let i = 0; i < 3; i++) {
+        last = await attempt();
+        if (last.statusCode === 412 || last.statusCode === 403) {
+            sessionReady = null;
+            cookieJar.delete('buvid3');
+            await ensureSession();
+            continue;
+        }
+        break;
+    }
+    if (last.statusCode === 412 || last.statusCode === 403) {
+        throw new Error('B 站风控拦截 (HTTP ' + last.statusCode + ')：当前出口 IP 被限制，多见于云服务器/机房 IP。请改用本机运行，或配置代理。');
+    }
+    try {
+        return JSON.parse(last.body);
+    } catch (e) {
+        throw new Error('JSON parse error: ' + last.body.slice(0, 200));
+    }
 }
 
 async function getBuvid() {
+    // bilibili returns data.b3 / data.b4 (not b_3); use the shared session cookie
     try {
-        const json = await httpGetJson('https://api.bilibili.com/x/frontend/finger/spi');
-        return json.data?.b_3 || 'FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc';
+        await ensureSession();
+        return cookieJar.get('buvid3') || 'FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc';
     } catch {
         return 'FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc';
     }
@@ -411,6 +513,30 @@ async function proxyToResponse({ req, res, requestId, setResponseTime, target, h
     }
 }
 
+async function runDiagnostics() {
+    const out = {};
+    try {
+        const spi = await rawGet('https://api.bilibili.com/x/frontend/finger/spi',
+            { 'User-Agent': UA, 'Referer': REFERER });
+        out.spi = { status: spi.statusCode, hasBuvid3: /buvid3/i.test(String(spi.headers['set-cookie'] || '')) };
+    } catch (e) { out.spi = { error: e.message }; }
+    try {
+        await ensureSession();
+        out.cookies = Array.from(cookieJar.keys());
+    } catch (e) { out.cookies = ['ERR ' + e.message]; }
+    try {
+        const v = await rawGet('https://api.bilibili.com/x/web-interface/view?bvid=BV1GJ411x7h7',
+            { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': jarHeader('api.bilibili.com') });
+        let code = null;
+        try { code = JSON.parse(v.body).code; } catch (e) { /* ignore */ }
+        out.view = { status: v.statusCode, code, bodyHead: v.body.slice(0, 160) };
+    } catch (e) { out.view = { error: e.message }; }
+    out.verdict = out.view && out.view.status === 200 && out.view.code === 0
+        ? 'OK: 当前出口 IP 可正常访问 B 站接口'
+        : 'BLOCKED: 出口 IP 可能被 B 站风控（412/风险提示）';
+    return out;
+}
+
 function handleRequest(req, res) {
     const requestId = crypto.randomBytes(8).toString('hex');
     const startTime = process.hrtime.bigint();
@@ -602,6 +728,16 @@ function handleRequest(req, res) {
                     sendHtml(res, setResponseTime, html);
                 } catch (e) {
                     sendHtml(res, setResponseTime, buildErrorHtml(e.message));
+                }
+                return;
+            }
+
+            if (urlPath === '/api/diag') {
+                try {
+                    const data = await runDiagnostics();
+                    sendJson(res, setResponseTime, data, { 'Access-Control-Allow-Origin': '*' });
+                } catch (e) {
+                    sendApiError(res, setResponseTime, e.message, true);
                 }
                 return;
             }
